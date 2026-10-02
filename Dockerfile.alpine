@@ -1,0 +1,174 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=alpine:3.24
+
+FROM ${BASE_IMAGE} AS build
+SHELL ["/bin/ash", "-euo", "pipefail", "-c"]
+RUN apk add --no-cache \
+      aom-dev \
+      build-base \
+      cmake \
+      dav1d-dev \
+      libjpeg-turbo-dev \
+      libpng-dev \
+      libwebp-dev \
+      pkgconf \
+      scanelf \
+      tiff-dev \
+      x265-dev \
+      zlib-dev
+ARG JOBS
+
+# Alpine's libde265 lacks upstream security fixes, so it is compiled from the
+# upstream release. It is installed twice: into /usr/local for the libheif
+# build and into /out for the image.
+ARG LIBDE265_VERSION
+ARG LIBDE265_SHA256
+ADD --checksum=sha256:${LIBDE265_SHA256} https://github.com/strukturag/libde265/releases/download/v${LIBDE265_VERSION}/libde265-${LIBDE265_VERSION}.tar.gz /src/libde265.tar.gz
+WORKDIR /src/libde265
+RUN tar -xzf /src/libde265.tar.gz --strip-components=1; \
+    cmake -S . -B build \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -DCMAKE_INSTALL_LIBDIR=lib \
+      -DENABLE_DECODER=OFF \
+      -DENABLE_SDL=OFF; \
+    cmake --build build -j"${JOBS:-$(nproc)}"; \
+    cmake --install build --strip; \
+    DESTDIR=/out cmake --install build --strip
+
+ARG VERSION
+ARG SOURCE_SHA256
+ADD --checksum=sha256:${SOURCE_SHA256} https://github.com/strukturag/libheif/releases/download/v${VERSION}/libheif-${VERSION}.tar.gz /src/libheif.tar.gz
+WORKDIR /src/libheif
+# The codecs are compiled into libheif instead of being loaded as plugins, so
+# the runtime-deps scan below finds them. Every codec option is set, so a
+# release that changes a default cannot add a codec to the image. musl
+# searches /usr/local/lib before /usr/lib, so no RUNPATH is needed to prefer
+# these libraries over the Alpine packages.
+RUN tar -xzf /src/libheif.tar.gz --strip-components=1; \
+    set -- \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -DCMAKE_INSTALL_LIBDIR=lib \
+      -DENABLE_PLUGIN_LOADING=OFF \
+      -DWITH_LIBDE265=ON \
+      -DWITH_X265=ON \
+      -DWITH_DAV1D=ON \
+      -DWITH_AOM_ENCODER=ON \
+      -DWITH_AOM_DECODER=OFF \
+      -DWITH_LIBSHARPYUV=ON \
+      -DWITH_X264=OFF \
+      -DWITH_OpenH264_DECODER=OFF \
+      -DWITH_KVAZAAR=OFF \
+      -DWITH_SvtEnc=OFF \
+      -DWITH_RAV1E=OFF \
+      -DWITH_JPEG_DECODER=OFF \
+      -DWITH_JPEG_ENCODER=OFF \
+      -DWITH_OpenJPEG_DECODER=OFF \
+      -DWITH_OpenJPEG_ENCODER=OFF \
+      -DWITH_OPENJPH_ENCODER=OFF \
+      -DWITH_FFMPEG_DECODER=OFF \
+      -DWITH_UVG266=OFF \
+      -DWITH_VVDEC=OFF \
+      -DWITH_VVENC=OFF \
+      -DWITH_UNCOMPRESSED_CODEC=OFF \
+      -DWITH_HEADER_COMPRESSION=OFF \
+      -DWITH_EXAMPLES=ON \
+      -DWITH_EXAMPLE_HEIF_THUMB=ON \
+      -DWITH_EXAMPLE_HEIF_VIEW=OFF \
+      -DWITH_GDK_PIXBUF=OFF \
+      -DBUILD_TESTING=OFF \
+      -DBUILD_DOCUMENTATION=OFF; \
+    echo "$*" > /tmp/cmake-options; \
+    cmake -S . -B build "$@"; \
+    cmake --build build -j"${JOBS:-$(nproc)}"; \
+    DESTDIR=/out cmake --install build --strip; \
+    rm -rf /out/usr/local/include /out/usr/local/lib/cmake /out/usr/local/lib/libheif /out/usr/local/lib/pkgconfig \
+      /out/usr/local/share/man /out/usr/local/share/thumbnailers; \
+    rm -f /out/usr/local/bin/heif-test
+
+# CMake leaves out a codec or an image format without failing when its
+# library is missing, so the libraries libheif and the tools link are checked
+# here.
+RUN needs() { \
+      file="$1"; shift; \
+      scanelf --needed --nobanner --format '%n#p' "$file" | tr ',' '\n' > /tmp/needed; \
+      for lib in "$@"; do \
+        grep -Fq "$lib" /tmp/needed \
+          || { cat /tmp/needed >&2; echo "$file does not link $lib" >&2; exit 1; }; \
+      done; \
+    }; \
+    needs /out/usr/local/lib/libheif.so.1 libde265.so.0 libx265.so libaom.so libdav1d.so libsharpyuv.so; \
+    for tool in heif-dec heif-enc; do \
+      needs "/out/usr/local/bin/$tool" libheif.so.1 libjpeg.so libpng16.so libtiff.so libwebp.so; \
+    done; \
+    for tool in heif-info heif-thumbnailer; do \
+      needs "/out/usr/local/bin/$tool" libheif.so.1; \
+    done; \
+    test "$(readlink /out/usr/local/bin/heif-convert)" = heif-dec
+
+ARG BASE_IMAGE
+# runtime-deps lists the so: names the tools and libheif need, minus the
+# libraries built here, plus the packages in runtime-deps.alpine. The heif-*
+# tools are under the MIT license, with the copyright lines in the first
+# comment of each source file.
+RUN --mount=type=bind,source=runtime-deps.alpine,target=/tmp/runtime-deps.extra \
+    export LC_ALL=C; \
+    meta=/out/usr/local/share/randomcontainers/libheif; \
+    mkdir -p "$meta/licenses"; \
+    cp COPYING "$meta/licenses/COPYING.libheif"; \
+    cp /src/libde265/COPYING "$meta/licenses/COPYING.libde265"; \
+    { \
+      for f in examples/common.cc examples/heif_dec.cc examples/heif_enc.cc examples/heif_info.cc \
+               examples/heif_thumbnailer.cc heifio/*.cc heifio/*.h; do \
+        awk '/Copyright/ { c = c $0 "\n" } /MIT License/ { m = 1 } /\*\// { if (m) printf "%s", c; exit }' "$f"; \
+      done | sed 's/^[[:space:]*]*//' | sort -u; \
+      echo; \
+      cat examples/COPYING; \
+    } > "$meta/licenses/COPYING.examples"; \
+    grep -q '^Copyright' "$meta/licenses/COPYING.examples"; \
+    for f in "$meta"/licenses/*; do test -s "$f"; done; \
+    echo "${VERSION}" > "$meta/version"; \
+    printf '%s\n' \
+      "https://github.com/strukturag/libheif/releases/download/v${VERSION}/libheif-${VERSION}.tar.gz" \
+      "https://github.com/strukturag/libde265/releases/download/v${LIBDE265_VERSION}/libde265-${LIBDE265_VERSION}.tar.gz" \
+      "https://github.com/randomcontainers/libheif/releases/tag/v${VERSION}" \
+      > "$meta/source"; \
+    export LD_LIBRARY_PATH=/out/usr/local/lib; \
+    /out/usr/local/bin/heif-dec --version > /tmp/heif-version; \
+    test "$(sed -n 1p /tmp/heif-version)" = "${VERSION}"; \
+    grep -Fqx 'plugin path: plugins are disabled' /tmp/heif-version; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "compiler: $(c++ --version | sed -n 1p)"; \
+      echo "libheif: ${VERSION} sha256:${SOURCE_SHA256}"; \
+      echo "libde265: ${LIBDE265_VERSION} sha256:${LIBDE265_SHA256}"; \
+      echo "cmake: $(cat /tmp/cmake-options)"; \
+      /out/usr/local/bin/heif-dec --list-decoders; \
+      /out/usr/local/bin/heif-enc --list-encoders; \
+    } > "$meta/buildinfo"; \
+    unset LD_LIBRARY_PATH; \
+    scanelf --needed --nobanner --format '%n#p' --recursive /out/usr/local | tr ',' '\n' | sort -u > /tmp/needed; \
+    while read -r so; do \
+      if [ -n "$so" ] && [ -z "$(find /out -name "$so" -print -quit)" ]; then echo "so:$so"; fi; \
+    done < /tmp/needed > /tmp/elf-deps; \
+    test -s /tmp/elf-deps; \
+    sort -u /tmp/elf-deps /tmp/runtime-deps.extra > "$meta/runtime-deps"; \
+    if grep -E '^(so:)?lib(heif|de265)' "$meta/runtime-deps"; then \
+      echo "runtime-deps must not pull in the distro's libheif or libde265" >&2; exit 1; \
+    fi
+
+FROM ${BASE_IMAGE} AS slim
+COPY --link --from=build /out/usr/local/ /usr/local/
+RUN set -eu; \
+    xargs apk add --no-cache ca-certificates tini < /usr/local/share/randomcontainers/libheif/runtime-deps; \
+    addgroup -g 1000 app; \
+    adduser -D -u 1000 -G app app; \
+    install -d -m 1777 /work /cache
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "heif-dec"]
+CMD ["--help"]
