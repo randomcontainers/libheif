@@ -1,0 +1,176 @@
+name: libheif
+title: libheif
+summary: Converts HEIC and AVIF images to JPEG, PNG, TIFF and WebP with heif-dec, and encodes images as HEIC or AVIF with heif-enc.
+homepage: https://github.com/strukturag/libheif
+# libheif and libde265 are under the LGPL and the heif-* tools under the MIT
+# license. libheif is linked with the x265 HEVC encoder, which is under the GPL.
+license: LGPL-3.0-or-later AND MIT AND GPL-2.0-or-later
+source-release: true
+upstream:
+  source: github-release
+  repository: strukturag/libheif
+  # Release tags look like v1.23.6.
+  tag-pattern: '^v(\d+\.\d+\.\d+)$'
+  version-template: '{1}'
+  versioning: semver
+  version: 1.23.6
+  # libheif and libde265 publish no checksums or signatures. The hashes are
+  # the digests GitHub records for the release assets.
+  artifact:
+    url: https://github.com/strukturag/libheif/releases/download/v{version}/libheif-{version}.tar.gz
+    sha256: 4484346dc5995319dbc11e3a1c35d0a2ec46511ce370900869337fd2c7033125
+  extra-artifacts:
+    libde265:
+      version: 1.1.3
+      url: https://github.com/strukturag/libde265/releases/download/v{version}/libde265-{version}.tar.gz
+      sha256: 554228bd17788c99a7e63b37ab5634722190e6e2bf60c1dcb01cef328e133905
+image:
+  entrypoint: [heif-dec]
+  cmd: [--help]
+test:
+  - |
+    same() { [ "$1" = "$2" ] || { echo "$3: got '$1', expected '$2'" >&2; exit 1; }; }
+    heif-dec --version > version.txt
+    same "$(head -n 1 version.txt)" "$VERSION" 'first line of heif-dec --version'
+    for line in "libheif: $VERSION" 'plugin path: plugins are disabled'; do
+      grep -Fqx "$line" version.txt || { echo "missing line: $line" >&2; cat version.txt >&2; exit 1; }
+    done
+    same "$(heif-info --version | head -n 1)" "$VERSION" 'first line of heif-info --version'
+    same "$(readlink /usr/local/bin/heif-convert)" heif-dec 'target of heif-convert'
+    for tool in heif-enc heif-thumbnailer; do
+      test -x "/usr/local/bin/$tool" || { echo "$tool is missing" >&2; exit 1; }
+    done
+  - |
+    heif-dec --list-decoders > decoders.txt
+    heif-enc --list-encoders > encoders.txt
+    # Each list has a heading per format, such as "HEIC decoders:", followed
+    # by lines of the form "- <id> = <name>".
+    listed() {
+      awk -v h="$1" '$0 == h { s = 1; next } /:$/ { s = 0 } s' "$3" | grep -q "^- $2 = " \
+        || { echo "$2 is not listed under $1" >&2; cat "$3" >&2; exit 1; }
+    }
+    listed 'HEIC decoders:' libde265 decoders.txt
+    listed 'AVIF decoders:' dav1d decoders.txt
+    listed 'HEIC encoders:' x265 encoders.txt
+    listed 'AVIF encoders:' aom encoders.txt
+  - |
+    # A 64x48 blue HEIC. Only decoding a real file shows that libheif can hand
+    # HEVC to libde265.
+    base64 -d > blue.heic <<'EOF'
+    AAAAJGZ0eXBoZWljAAAAAG1pZjFNaVBybWlhZk1pSEJoZWljAAABi21ldGEAAAAAAAAAIWhkbHIA
+    AAAAAAAAAHBpY3QAAAAAAAAAAAAAAAAAAAAAJGRpbmYAAAAcZHJlZgAAAAAAAAABAAAADHVybCAA
+    AAABAAAADnBpdG0AAAAAAAEAAAAjaWluZgAAAAAAAQAAABVpbmZlAgAAAAABAABodmMxAAAAAOtp
+    cHJwAAAAymlwY28AAAATY29scm5jbHgAAgACAAaAAAAADGNsbGkAywBAAAAAFGlzcGUAAAAAAAAA
+    QAAAADAAAAAJaXJvdAAAAAAQcGl4aQAAAAADCAgIAAAAdmh2Y0MBAWAAAACwAAAAAAAe8AD8/fj4
+    AAAPA6AAAQAXQAEMAf//AWAAAAMAsAAAAwAAAwAeLAmhAAEAIUIBAQFgAAADALAAAAMAAAMAHqAg
+    gxZy5JEpJcTcCAgYAqIAAQAQRAHAckwE6RERJEkSRJEqQAAAABlpcG1hAAAAAAAAAAEAAQaBAgMF
+    hoQAAAAeaWxvYwAAAABEAAABAAEAAAABAAABvwAAABgAAAABbWRhdAAAAAAAAAAoAAAAFCYBrcCz
+    Z//1KLd8TRv0UglOg2i4
+    EOF
+    for ext in png jpg tif webp y4m; do
+      heif-dec --quiet -d libde265 blue.heic "out.$ext"
+    done
+    same() { [ "$1" = "$2" ] || { echo "$3: got '$1', expected '$2'" >&2; exit 1; }; }
+    bytes() { od -An -tx1 -j"$2" -N"$3" "$1" | tr -d ' \n'; }
+    same "$(bytes out.png 0 8)" 89504e470d0a1a0a 'signature of out.png'
+    # The IHDR chunk of a PNG starts with the width and height.
+    same "$(bytes out.png 16 8)" 0000004000000030 'size of out.png'
+    same "$(bytes out.jpg 0 3)" ffd8ff 'signature of out.jpg'
+    case "$(bytes out.tif 0 4)" in
+      49492a00 | 4d4d002a) ;;
+      *) echo "out.tif is not a TIFF file" >&2; exit 1 ;;
+    esac
+    same "$(bytes out.webp 0 4) $(bytes out.webp 8 4)" '52494646 57454250' 'RIFF and WEBP tags of out.webp'
+    # A Y4M file is a text header, then the Y plane (64x48) and the Cb and Cr
+    # planes (32x24 each). Blue has low luma and a high Cb value.
+    printf 'YUV4MPEG2 W64 H48 F30:1\nFRAME\n' > y4m-header
+    head -c 30 out.y4m | cmp -s - y4m-header \
+      || { echo 'unexpected Y4M header in out.y4m:' >&2; head -c 30 out.y4m | od -c >&2; exit 1; }
+    same "$(wc -c < out.y4m | tr -d ' ')" 4638 'size of out.y4m in bytes'
+    y="$(od -An -tu1 -j30 -N1 out.y4m | tr -d ' \n')"
+    cb="$(od -An -tu1 -j3102 -N1 out.y4m | tr -d ' \n')"
+    if [ "$y" -ge 64 ] || [ "$cb" -le 192 ]; then echo "out.y4m is not blue: Y=$y Cb=$cb" >&2; exit 1; fi
+  - |
+    # out.png and y4m-header come from the test that decodes blue.heic.
+    heif-enc -e aom -q 60 out.png -o rt.avif > enc-avif.txt
+    brand="$(head -c 12 rt.avif | tail -c 8)"
+    [ "$brand" = ftypavif ] || { echo "rt.avif starts with $brand, expected ftypavif" >&2; exit 1; }
+    heif-info rt.avif > info-avif.txt
+    grep -Fq 'image: 64x48 (' info-avif.txt || { cat info-avif.txt >&2; exit 1; }
+    heif-dec --quiet -d dav1d rt.avif rt-avif.y4m
+    head -c 30 rt-avif.y4m | cmp -s - y4m-header \
+      || { echo 'unexpected Y4M header in rt-avif.y4m:' >&2; head -c 30 rt-avif.y4m | od -c >&2; exit 1; }
+    size="$(wc -c < rt-avif.y4m | tr -d ' ')"
+    [ "$size" = 4638 ] || { echo "rt-avif.y4m has $size bytes, expected 4638" >&2; exit 1; }
+    y="$(od -An -tu1 -j30 -N1 rt-avif.y4m | tr -d ' \n')"
+    cb="$(od -An -tu1 -j3102 -N1 rt-avif.y4m | tr -d ' \n')"
+    if [ "$y" -ge 64 ] || [ "$cb" -le 192 ]; then echo "rt.avif is not blue: Y=$y Cb=$cb" >&2; exit 1; fi
+  - |
+    # HEIC output needs an HEVC encoder, here x265. out.png and y4m-header come
+    # from the test that decodes blue.heic.
+    heif-enc -e x265 -q 50 out.png -o rt.heic > enc-heic.txt
+    brand="$(head -c 12 rt.heic | tail -c 8)"
+    [ "$brand" = ftypheic ] || { echo "rt.heic starts with $brand, expected ftypheic" >&2; exit 1; }
+    heif-info rt.heic > info-heic.txt
+    grep -Fq 'image: 64x48 (' info-heic.txt || { cat info-heic.txt >&2; exit 1; }
+    heif-dec --quiet -d libde265 rt.heic rt-heic.y4m
+    head -c 30 rt-heic.y4m | cmp -s - y4m-header \
+      || { echo 'unexpected Y4M header in rt-heic.y4m:' >&2; head -c 30 rt-heic.y4m | od -c >&2; exit 1; }
+    size="$(wc -c < rt-heic.y4m | tr -d ' ')"
+    [ "$size" = 4638 ] || { echo "rt-heic.y4m has $size bytes, expected 4638" >&2; exit 1; }
+    y="$(od -An -tu1 -j30 -N1 rt-heic.y4m | tr -d ' \n')"
+    cb="$(od -An -tu1 -j3102 -N1 rt-heic.y4m | tr -d ' \n')"
+    if [ "$y" -ge 64 ] || [ "$cb" -le 192 ]; then echo "rt.heic is not blue: Y=$y Cb=$cb" >&2; exit 1; fi
+  - |
+    heif-thumbnailer -s 32 blue.heic thumbnail.png
+    size="$(od -An -tx1 -j16 -N8 thumbnail.png | tr -d ' \n')"
+    [ "$size" = 0000002000000018 ] || { echo "thumbnail.png is not 32x24: $size" >&2; exit 1; }
+  - |
+    # libheif and libde265 are compiled into /usr/local/lib, and the tools must
+    # load them from there, not from a distro package.
+    ldd /usr/local/bin/heif-dec > heif-dec-libs.txt
+    grep -Fq 'libheif.so.1 => /usr/local/lib/libheif.so.1 ' heif-dec-libs.txt || { cat heif-dec-libs.txt >&2; exit 1; }
+    ldd /usr/local/lib/libheif.so.1 > libheif-libs.txt
+    grep -Fq 'libde265.so.0 => /usr/local/lib/libde265.so.0 ' libheif-libs.txt || { cat libheif-libs.txt >&2; exit 1; }
+    find /lib /usr/lib \( -name 'libheif.so*' -o -name 'libde265.so*' \) > distro-libs.txt 2> /dev/null || true
+    if [ -s distro-libs.txt ]; then echo "distro copies of libheif or libde265:" >&2; cat distro-libs.txt >&2; exit 1; fi
+examples:
+  - title: Convert a HEIC photo to JPEG
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/libheif photo.heic photo.jpg
+  - title: Convert every HEIC file in the current directory to JPEG
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" --entrypoint sh ghcr.io/randomcontainers/libheif -c 'for f in *.[hH][eE][iI][cC]; do heif-dec --quiet "$f" "${f%.*}.jpg"; done'
+  - title: Encode a PNG as AVIF
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" --entrypoint heif-enc ghcr.io/randomcontainers/libheif -q 60 input.png -o output.avif
+  - title: Convert a HEIC photo to JPEG without its GPS position (default image)
+    command: docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" --entrypoint sh ghcr.io/randomcontainers/libheif -c 'heif-dec --quiet photo.heic photo.jpg && exiftool -overwrite_original "-gps*=" photo.jpg'
+combos:
+  - with: [exiftool]
+    default: true
+    base: libheif
+    summary: libheif tools with ExifTool, for converting HEIC photos and editing or removing their metadata.
+    test:
+      - |
+        base64 -d > blue.heic <<'EOF'
+        AAAAJGZ0eXBoZWljAAAAAG1pZjFNaVBybWlhZk1pSEJoZWljAAABi21ldGEAAAAAAAAAIWhkbHIA
+        AAAAAAAAAHBpY3QAAAAAAAAAAAAAAAAAAAAAJGRpbmYAAAAcZHJlZgAAAAAAAAABAAAADHVybCAA
+        AAABAAAADnBpdG0AAAAAAAEAAAAjaWluZgAAAAAAAQAAABVpbmZlAgAAAAABAABodmMxAAAAAOtp
+        cHJwAAAAymlwY28AAAATY29scm5jbHgAAgACAAaAAAAADGNsbGkAywBAAAAAFGlzcGUAAAAAAAAA
+        QAAAADAAAAAJaXJvdAAAAAAQcGl4aQAAAAADCAgIAAAAdmh2Y0MBAWAAAACwAAAAAAAe8AD8/fj4
+        AAAPA6AAAQAXQAEMAf//AWAAAAMAsAAAAwAAAwAeLAmhAAEAIUIBAQFgAAADALAAAAMAAAMAHqAg
+        gxZy5JEpJcTcCAgYAqIAAQAQRAHAckwE6RERJEkSRJEqQAAAABlpcG1hAAAAAAAAAAEAAQaBAgMF
+        hoQAAAAeaWxvYwAAAABEAAABAAEAAAABAAABvwAAABgAAAABbWRhdAAAAAAAAAAoAAAAFCYBrcCz
+        Z//1KLd8TRv0UglOg2i4
+        EOF
+        same() { [ "$1" = "$2" ] || { echo "$3: got '$1', expected '$2'" >&2; exit 1; }; }
+        heif-dec --quiet blue.heic photo.jpg
+        same "$(exiftool -s3 -ImageSize photo.jpg)" 64x48 'size of photo.jpg'
+        exiftool -overwrite_original -GPSLatitude=48.8583 -GPSLatitudeRef=N -GPSLongitude=2.2945 -GPSLongitudeRef=E \
+          -XMP-exif:GPSLatitude=48.8583 -XMP-exif:GPSLongitude=2.2945 photo.jpg
+        [ -n "$(exiftool -s3 -EXIF:GPSLatitude photo.jpg)" ] || { echo 'photo.jpg has no EXIF GPSLatitude' >&2; exit 1; }
+        same "$(exiftool -n -s3 -XMP-exif:GPSLatitude photo.jpg)" 48.8583 'XMP GPSLatitude of photo.jpg'
+        # heif-dec copies both the EXIF and the XMP of a photo, and -gps:all=
+        # would leave the XMP copy of the position.
+        exiftool -overwrite_original '-gps*=' photo.jpg
+        left="$(exiftool -s3 '-gps*' photo.jpg)"
+        [ -z "$left" ] || { echo "GPS tags left in photo.jpg: $left" >&2; exit 1; }
+        same "$(exiftool -s3 -ImageSize photo.jpg)" 64x48 'size of photo.jpg after removing GPS tags'
