@@ -13,12 +13,12 @@ upstream:
   tag-pattern: '^v(\d+\.\d+\.\d+)$'
   version-template: '{1}'
   versioning: semver
-  version: 1.23.6
+  version: 1.23.7
   # libheif and libde265 publish no checksums or signatures. The hashes are
   # the digests GitHub records for the release assets.
   artifact:
     url: https://github.com/strukturag/libheif/releases/download/v{version}/libheif-{version}.tar.gz
-    sha256: 4484346dc5995319dbc11e3a1c35d0a2ec46511ce370900869337fd2c7033125
+    sha256: f7483e818503ea6224c8863e4a56ac02c7089021a98472c811c12aa19faf2475
   extra-artifacts:
     libde265:
       version: 1.1.3
