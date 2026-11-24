@@ -129,7 +129,16 @@ gh attestation verify oci://ghcr.io/randomcontainers/libheif:latest \
   --repo randomcontainers/libheif --signer-repo randomcontainers/ci
 ```
 
-Images from `ghcr.io/randomcontainers/libheif-exiftool` are built in that repository, so verify them with `--repo randomcontainers/libheif-exiftool` and the same `--signer-repo`.
+Images published since November 2026 also have a keyless cosign signature from the same workflow, for admission controllers that check cosign signatures. Tags last built before then have only the attestation.
+
+```sh
+cosign verify ghcr.io/randomcontainers/libheif:latest \
+  --certificate-identity https://github.com/randomcontainers/ci/.github/workflows/build.yml@refs/tags/v1 \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-github-workflow-repository randomcontainers/libheif
+```
+
+Images from `ghcr.io/randomcontainers/libheif-exiftool` are built in [randomcontainers/libheif-exiftool](https://github.com/randomcontainers/libheif-exiftool), so use `randomcontainers/libheif-exiftool` in `--repo` and `--certificate-github-workflow-repository`.
 
 Each platform image also carries an SPDX SBOM that lists every distro package with its version:
 
